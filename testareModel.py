@@ -8,7 +8,7 @@ import torchvision.transforms as transforms
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, confusion_matrix
 
 # Import modelul (se presupune că returnează două ieșiri: seg_logits și cls_logits)
-from zoo.VNet import UNetSegClassifier1024
+from architectures.VNet import UNetSegClassifier1024
 from dataloader import PngDataset  # folosim clasa de dataset deja definită
 
 

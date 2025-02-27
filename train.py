@@ -7,9 +7,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
 from sklearn.metrics import roc_auc_score
-from zoo.VNet import UNetSegClassifier1024
+from architectures.VNet import UNetSegClassifier1024
 from dataloader import PngDataset, data_transforms
-from zoo.AttentionUnet import AttentionUNet1024Classifier
+from architectures.AttentionUnet import AttentionUNet1024Classifier
 
 
 def load_data(json_path):
