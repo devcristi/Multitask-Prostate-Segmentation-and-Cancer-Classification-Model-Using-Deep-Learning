@@ -1,318 +1,382 @@
 import os
+import sys
 import json
 import torch
-from torch.utils.data import DataLoader
 import numpy as np
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-from sklearn.model_selection import KFold
+from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
-from architectures.VNet import UNetSegClassifier1024
-from dataloader import PngDataset, data_transforms
-from architectures.AttentionUnet import AttentionUNet1024Classifier
+from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader
+import torch.nn as nn
+import torchvision.transforms as transforms
+from PIL import Image
+
+from architectures.AttentionUnet import AttentionUNet1024Classifier  # Using your custom UNet implementation
+
+# ========== Configuration ==========
+# Ajustează aceste directoare după necesitate.
+root_dir = r"D:\study\facultate\test_cuda\data"  # Directorul de bază. Când se face join cu căile din JSON se obțin căile complete.
+json_path = r"D:\study\facultate\test_cuda\data\output9CanaleV3\dataset_distributie.json"
+
+batch_size = 32
+num_epochs = 20  # Număr mai mare de epoci pentru antrenare
+num_folds = 5  # Cross Validation: numărul de fold-uri.
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+best_model_overall_path = "best_multi_task_model.pth"
+results_txt = "training_results.txt"
+
+# Directorul pentru salvarea imaginilor de comparație a segmentărilor
+results_dir = r"D:\study\facultate\test_cuda\results"
+if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
 
 
-def load_data(json_path):
-    """Încarcă datele din fișierul JSON."""
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    return data
-
-
+# ========== Utility Functions ==========
 def dice_coefficient(pred, target, smooth=1e-7):
     """
-    Calculează coeficientul Dice pentru două mape binare (0/1).
-    pred și target sunt tensori de tip float/binar (0/1).
+    Compute the Dice coefficient for a single image.
+    Both pred and target should be binary masks.
     """
     intersection = (pred * target).sum().item()
     dice = (2. * intersection + smooth) / (pred.sum().item() + target.sum().item() + smooth)
     return dice
 
 
-def train_epoch(model, device, loader, optimizer, criterion_cls, criterion_seg):
-    """
-    Antrenează modelul multi-task (segmentare + clasificare) pe un epoch.
-    - model(data) -> (seg_logits, cls_logits)
-    - data, mask, gs provin din DataLoader: (image, mask, GS)
-    """
+def train_epoch(model, device, loader, optimizer, criterion_seg, criterion_cls):
     model.train()
     running_loss = 0.0
-    running_cls_loss = 0.0
     running_seg_loss = 0.0
-    for inputs, seg_target, gs in tqdm(loader, desc="Training", unit="batch"):
+    running_cls_loss = 0.0
+    for inputs, seg_target, cls_label in tqdm(loader, desc="Training", unit="batch"):
         inputs = inputs.to(device)
-        seg_target = seg_target.to(device)
-        gs = gs.to(device).float()
-
+        seg_target = seg_target.to(device)  # Shape: [B, H, W]
+        cls_label = cls_label.to(device).float()  # Shape: [B]
         optimizer.zero_grad()
         seg_logits, cls_logits = model(inputs)
-        cls_loss = criterion_cls(cls_logits.squeeze(1), gs)
-        seg_loss = criterion_seg(seg_logits, seg_target)
-
-        # Aici am pus weight=0 la seg_loss,
-        # dar poți schimba la 1 dacă vrei să antrenezi și segmentarea
-        # loss = cls_loss + 0 * seg_loss
-        loss = cls_loss + 0.1 * seg_loss  # încearcă 0.1, 0.5, 1
+        loss_seg = criterion_seg(seg_logits, seg_target)
+        loss_cls = criterion_cls(cls_logits.squeeze(1), cls_label)
+        loss = loss_seg + loss_cls
         loss.backward()
         optimizer.step()
-
         running_loss += loss.item() * inputs.size(0)
-        running_cls_loss += cls_loss.item() * inputs.size(0)
-        running_seg_loss += seg_loss.item() * inputs.size(0)
-
+        running_seg_loss += loss_seg.item() * inputs.size(0)
+        running_cls_loss += loss_cls.item() * inputs.size(0)
     epoch_loss = running_loss / len(loader.dataset)
-    epoch_cls_loss = running_cls_loss / len(loader.dataset)
     epoch_seg_loss = running_seg_loss / len(loader.dataset)
-    return epoch_loss, epoch_cls_loss, epoch_seg_loss
+    epoch_cls_loss = running_cls_loss / len(loader.dataset)
+    return epoch_loss, epoch_seg_loss, epoch_cls_loss
 
 
-def validate_epoch(model, device, loader, criterion_cls, criterion_seg):
-    """
-    Validează modelul (segmentare + clasificare) și returnează:
-      - Val Loss
-      - Acuratețe, Precizie, Recall, Specificitate, F1, AUROC
-      - Dice mediu (pe 2 clase: fundal și tumoare)
-    """
+def validate_epoch(model, device, loader, criterion_seg, criterion_cls):
     model.eval()
     running_loss = 0.0
+    running_seg_loss = 0.0
+    running_cls_loss = 0.0
     all_cls_preds = []
     all_cls_labels = []
-
-    dice_scores_background = []
-    dice_scores_tumor = []
-    dice_scores_mean = []
-
+    dice_total = 0.0
     with torch.no_grad():
-        for inputs, seg_target, gs in tqdm(loader, desc="Validating", unit="batch"):
+        for inputs, seg_target, cls_label in tqdm(loader, desc="Validating", unit="batch"):
             inputs = inputs.to(device)
             seg_target = seg_target.to(device)
-            gs = gs.to(device).float()
-
+            cls_label = cls_label.to(device).float()
             seg_logits, cls_logits = model(inputs)
-            cls_loss = criterion_cls(cls_logits.squeeze(1), gs)
-            seg_loss = criterion_seg(seg_logits, seg_target)
-
-            # Aici punem weight=0 la seg_loss,
-            # dar poți schimba la 1 dacă vrei să antrenezi și segmentarea
-            loss = cls_loss + 0 * seg_loss
-
+            loss_seg = criterion_seg(seg_logits, seg_target)
+            loss_cls = criterion_cls(cls_logits.squeeze(1), cls_label)
+            loss = loss_seg + loss_cls
             running_loss += loss.item() * inputs.size(0)
-
-            # Clasificare
+            running_seg_loss += loss_seg.item() * inputs.size(0)
+            running_cls_loss += loss_cls.item() * inputs.size(0)
             cls_preds = torch.sigmoid(cls_logits.squeeze(1))
             all_cls_preds.append(cls_preds.cpu())
-            all_cls_labels.append(gs.cpu())
-
-            # Segmentare (dacă vrei să monitorizezi dice, chiar dacă weight=0)
+            all_cls_labels.append(cls_label.cpu())
             seg_preds = torch.argmax(seg_logits, dim=1)  # [B, H, W]
             for i in range(seg_target.size(0)):
-                target_img = seg_target[i]
-                pred_img = seg_preds[i]
-                # 0 = fundal, 1 = tumoare
-                bg_target = (target_img == 0).float()
-                bg_pred = (pred_img == 0).float()
-                tumor_target = (target_img == 1).float()
-                tumor_pred = (pred_img == 1).float()
-
-                dice_bg = dice_coefficient(bg_pred, bg_target)
-                dice_tumor = dice_coefficient(tumor_pred, tumor_target)
-                dice_mean_img = (dice_bg + dice_tumor) / 2.0
-                dice_scores_background.append(dice_bg)
-                dice_scores_tumor.append(dice_tumor)
-                dice_scores_mean.append(dice_mean_img)
-
+                dice_total += dice_coefficient(seg_preds[i].float(), seg_target[i].float())
     epoch_loss = running_loss / len(loader.dataset)
+    epoch_seg_loss = running_seg_loss / len(loader.dataset)
+    epoch_cls_loss = running_cls_loss / len(loader.dataset)
     all_cls_preds = torch.cat(all_cls_preds)
     all_cls_labels = torch.cat(all_cls_labels)
-
-    # Clasificare
-    cls_pred_labels = (all_cls_preds > 0.5).float()
-    accuracy = (cls_pred_labels == all_cls_labels).float().mean().item()
-    TP = ((cls_pred_labels == 1) & (all_cls_labels == 1)).sum().item()
-    TN = ((cls_pred_labels == 0) & (all_cls_labels == 0)).sum().item()
-    FP = ((cls_pred_labels == 1) & (all_cls_labels == 0)).sum().item()
-    FN = ((cls_pred_labels == 0) & (all_cls_labels == 1)).sum().item()
-
-    precision = TP / (TP + FP + 1e-7)
-    recall = TP / (TP + FN + 1e-7)
-    specificity = TN / (TN + FP + 1e-7)
-    f1 = 2 * precision * recall / (precision + recall + 1e-7)
     try:
         auroc = roc_auc_score(all_cls_labels.numpy(), all_cls_preds.numpy())
     except ValueError:
         auroc = float('nan')
-
-    dice_bg_mean = np.mean(dice_scores_background)
-    dice_tumor_mean = np.mean(dice_scores_tumor)
-    dice_mean = np.mean(dice_scores_mean)
-
-    return epoch_loss, accuracy, precision, recall, specificity, f1, auroc, dice_bg_mean, dice_tumor_mean, dice_mean
+    mean_dice = dice_total / len(loader.dataset)
+    return epoch_loss, epoch_seg_loss, epoch_cls_loss, auroc, mean_dice
 
 
-def run_kfold_training(json_path, root_dir, num_epochs=20, batch_size=16, k_folds=5):
+def plot_history(epochs, history, ylabel, title, filename):
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(1, epochs + 1), history, marker='o', label=ylabel)
+    plt.xlabel("Epoch")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(filename)
+    plt.close()
+
+
+def save_segmentation_comparison(val_dataset, model, device, fold, epoch, results_dir):
     """
-    K-Fold Cross Validation pentru antrenarea multi-task (segmentare + clasificare).
-    -> Checkpoint se salvează după cel mai bun AUROC (nu după val_acc).
+    Salvează o comparație între segmentarea originală și predicția modelului.
+    Folosește primul eșantion din dataset-ul de validare.
     """
-    import shutil
-    from sklearn.model_selection import KFold
+    model.eval()
+    sample, gt_mask, _ = val_dataset[0]
+    input_img = sample.unsqueeze(0).to(device)
+    with torch.no_grad():
+        seg_logits, _ = model(input_img)
+    pred_mask = torch.argmax(seg_logits, dim=1).squeeze(0).cpu().numpy()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Pentru afișare, selectăm doar primul canal din imagine (deoarece sample are 9 canale)
+    img_np = sample.cpu().permute(1, 2, 0).numpy()  # forma: (128, 128, 9)
+    # Selectăm primul canal pentru vizualizare, ca imagine grayscale:
+    img_to_show = img_np[:, :, 0]
+    img_to_show = np.clip(img_to_show, 0, 1)
 
-    # Încărcăm datele
+    gt_mask_np = gt_mask.cpu().numpy()
+
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.imshow(img_to_show, cmap="gray")
+    plt.title("Original Image (Channel 0)")
+    plt.axis("off")
+    plt.subplot(1, 3, 2)
+    plt.imshow(gt_mask_np, cmap="gray")
+    plt.title("Ground Truth Segmentation")
+    plt.axis("off")
+    plt.subplot(1, 3, 3)
+    plt.imshow(pred_mask, cmap="gray")
+    plt.title("Predicted Segmentation")
+    plt.axis("off")
+    plt.tight_layout()
+
+    save_path = os.path.join(results_dir, f"fold{fold}_epoch{epoch}_segmentation_comparison.png")
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Segmentation comparison saved to {save_path}")
+
+
+# ========== Dataset Classes ==========
+
+# --- Noul dataset care încarcă .npy cu concatenare pe canale (rezultat: 128x128x9) ---
+class NpyDataset(torch.utils.data.Dataset):
+    def __init__(self, data_dict, root_dir, split="train", test_ratio=0.2, seed=42):
+        """
+        Dataset care:
+          - Împarte cheile (pacienții) în train/test în funcție de test_ratio.
+          - Pentru fiecare pacient, în __getitem__:
+             * Încarcă imaginea .npy (128x128x9) din directorul 'output9CanaleV3/concatenare_canale'
+             * Încărcă masca PNG (felia de mijloc), o redimensionează la 128x128 și o convertește în tensor Long.
+             * Returnează (image_tensor, mask_tensor, gs)
+        """
+        valid_keys = [key for key, item in data_dict.items() if "slice" in item and "data" in item and "label" in item]
+        valid_keys.sort()
+        np.random.seed(seed)
+        np.random.shuffle(valid_keys)
+        test_size = int(len(valid_keys) * test_ratio)
+        if split == "train":
+            self.keys = valid_keys[test_size:]
+        else:
+            self.keys = valid_keys[:test_size]
+        self.data_dict = data_dict
+        self.root_dir = root_dir  # ex: D:\study\facultate\test_cuda\data
+        self.resize_mask = transforms.Resize((128, 128), interpolation=transforms.InterpolationMode.NEAREST)
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        item = self.data_dict[key]
+
+        # 1) Încarcă imaginea .npy (128,128,9) pentru pacient.
+        # Presupunem că fișierul se numește: {key}_9channels.npy și se află în:
+        # D:\study\facultate\test_cuda\data\output9CanaleV3\concatenare_canale\
+        npy_path = os.path.join(self.root_dir, "output9CanaleV3", "concatenare_canale", f"{key}_9channels.npy")
+        if not os.path.exists(npy_path):
+            raise FileNotFoundError(f"Nu am găsit fișierul: {npy_path}")
+        img_9ch = np.load(npy_path)  # forma: (128, 128, 9)
+        # Convertim la tensor PyTorch și permutăm la [C, H, W]
+        image_tensor = torch.from_numpy(img_9ch).permute(2, 0, 1).float()
+
+        # 2) Încarcă masca: se folosește felia de mijloc.
+        slices = sorted(item["slice"])
+        mid_slice = slices[len(slices) // 2]
+        slice_index = item["slice"].index(mid_slice)
+        mask_relative_path = item["label"][slice_index]
+        mask_path = os.path.join(self.root_dir, mask_relative_path)
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"Nu am găsit fișierul pentru mască: {mask_path}")
+        mask_pil = Image.open(mask_path).convert("L")
+        mask_pil = self.resize_mask(mask_pil)
+        mask_np = np.array(mask_pil)
+        if mask_np.max() > 1:
+            mask_np = (mask_np > 127).astype(np.int64)
+        mask_tensor = torch.from_numpy(mask_np).long()
+
+        # 3) Obține label-ul numeric GS
+        gs = int(item.get("GS", 0))
+
+        return image_tensor, mask_tensor, gs
+
+# --- Clasa veche PngDataset (comentată) ---
+"""
+class PngDataset(Dataset):
+    def __init__(self, data_dict, root_dir, split="train", test_ratio=0.2, transform=None, seed=42):
+        valid_keys = [key for key, item in data_dict.items() if "slice" in item and "data" in item and "label" in item]
+        valid_keys.sort()
+        random.seed(seed)
+        random.shuffle(valid_keys)
+        test_size = int(len(valid_keys) * test_ratio)
+        self.keys = valid_keys[test_size:] if split == "train" else valid_keys[:test_size]
+        self.data_dict = data_dict
+        self.root_dir = root_dir
+        self.transform = transform if transform is not None else data_transforms
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        item = self.data_dict[key]
+        slices = sorted(item["slice"])
+        mid_slice = slices[len(slices) // 2]
+        slice_index = item["slice"].index(mid_slice)
+
+        img_types = ["T2W", "ADC", "HBV"]
+        all_slices = []
+        resize_transform = transforms.Resize((128, 128), interpolation=transforms.InterpolationMode.BILINEAR)
+
+        for img_type in img_types:
+            slice_images = []
+            for i in range(-1, 2):  # -1, 0, 1 slices
+                try:
+                    img_relative_path = item["data"][img_type][slice_index + i]
+                except IndexError:
+                    img_relative_path = item["data"][img_type][slice_index]
+                img_path = os.path.join(self.root_dir, img_relative_path)
+                image = Image.open(img_path).convert("L")
+                image = resize_transform(image)
+                image_tensor = transforms.ToTensor()(image)
+                slice_images.append(image_tensor)
+            all_slices.append(torch.cat(slice_images, dim=0))
+        img_tensor = torch.cat(all_slices, dim=0)  # [9, 128, 128]
+        mask_relative_path = item["label"][slice_index]
+        mask_path = os.path.join(self.root_dir, mask_relative_path)
+        mask = Image.open(mask_path).convert("L")
+        mask = resize_transform(mask)
+        _, mask_tensor = self.transform(mask, mask)
+        gs = int(item.get("GS", 0))
+        return img_tensor, mask_tensor, gs
+"""
+
+
+# ========== Training with K-Fold Cross Validation ==========
+def train_model():
+    # Încarcă JSON-ul datasetului.
     with open(json_path, 'r') as f:
         data_dict = json.load(f)
-    keys = list(data_dict.keys())
-    np.random.shuffle(keys)
+    if "cancer" in data_dict and "non_cancer" in data_dict:
+        patients_data = {}
+        patients_data.update(data_dict["cancer"])
+        patients_data.update(data_dict["non_cancer"])
+    else:
+        patients_data = data_dict
 
-    # Definim criteriile
-    criterion_cls = torch.nn.BCEWithLogitsLoss()
-    criterion_seg = torch.nn.CrossEntropyLoss()
+    if not patients_data:
+        print("ERROR: Dataset JSON is empty. Please check your file and required fields.")
+        sys.exit(1)
 
-    kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+    keys = list(patients_data.keys())
+    kf = KFold(n_splits=num_folds, shuffle=True, random_state=42)
 
-    # Vom stoca cele mai bune valori pt fold, definim structura
-    fold_results = []
+    best_overall_auroc = 0.0
+    best_overall_fold = -1
+    best_fold_results = {}
+    best_model_state = None
+    fold_logs = []
+    fold_auroc_per_epoch = [[] for _ in range(num_epochs)]  # Salvează AUROC per epocă per fold
 
-    for fold, (train_idx, valid_idx) in enumerate(kf.split(keys)):
-        fold_num = fold + 1
-        print(f"\n===== Fold {fold_num}/{k_folds} =====")
+    best_overall_auroc = 0.0
+    best_epoch_overall = -1
+    best_model_state = None
 
-        fold_dir = os.path.join("results", f"fold_{fold_num}")
-        if os.path.exists(fold_dir):
-            shutil.rmtree(fold_dir)
-        os.makedirs(fold_dir, exist_ok=True)
+    fold_index = 1
+    for train_index, val_index in kf.split(keys):
+        print(f"\n=============== Fold {fold_index}/{num_folds} ===============")
+        train_keys = [keys[i] for i in train_index]
+        val_keys = [keys[i] for i in val_index]
+        train_data = {k: patients_data[k] for k in train_keys}
+        val_data = {k: patients_data[k] for k in val_keys}
 
-        train_keys = [keys[i] for i in train_idx]
-        valid_keys = [keys[i] for i in valid_idx]
+        # Folosește noul dataset NpyDataset (pentru imagini din .npy)
+        train_dataset = NpyDataset(train_data, root_dir, split="train", test_ratio=0.2, seed=42)
+        val_dataset = NpyDataset(val_data, root_dir, split="val", test_ratio=0.2, seed=42)
 
-        train_data = {k: data_dict[k] for k in train_keys}
-        valid_data = {k: data_dict[k] for k in valid_keys}
-
-        # Salvăm datele de validare
-        val_data_path = os.path.join(fold_dir, "val_data.json")
-        with open(val_data_path, 'w') as f:
-            json.dump(valid_data, f, indent=4)
-        print(f"Validation data for fold {fold_num} saved in {val_data_path}")
-
-        # Construim dataseturile
-        train_dataset = PngDataset(train_data, root_dir, transform=data_transforms)
-        valid_dataset = PngDataset(valid_data, root_dir, transform=data_transforms)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-        valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-        # Model + optimizer
-        model = UNetSegClassifier1024(1,2,1)  # segmentare 2 clase
-        # NOTĂ: Dacă vrei clasificare binară -> n_bin_classes=1
-        # Poate fi: model = AttentionUNet1024Classifier(1,2,1).to(device)
-        model = model.to(device)
+        model = AttentionUNet1024Classifier(n_channels=9, n_seg_classes=3, n_bin_classes=1).to(device)
+        criterion_seg = nn.CrossEntropyLoss()
+        criterion_cls = nn.BCEWithLogitsLoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
 
-        # Vom face checkpoint când AUROC e cel mai mare
-        best_val_auroc = 0.0
-        best_val_acc = 0.0
-        best_val_recall = 0.0
-        best_val_spec = 0.0
-
-        # Pentru plot
-        epoch_nums = []
-        train_loss_list = []
-        val_loss_list = []
-        accuracy_list = []
-        auroc_list = []
-
         for epoch in range(num_epochs):
-            train_loss, train_cls_loss, train_seg_loss = train_epoch(
-                model, device, train_loader, optimizer, criterion_cls, criterion_seg
-            )
-            (val_loss, val_acc, precision, recall, specificity, f1, auroc,
-             dice_bg, dice_tumor, dice_mean) = validate_epoch(
-                model, device, valid_loader, criterion_cls, criterion_seg
-            )
+            print(f"Epoch [{epoch + 1}/{num_epochs}]")
 
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"[Fold {fold_num}, Epoch {epoch + 1}/{num_epochs}]")
-            print(f"  Train Loss: {train_loss:.4f} (Cls: {train_cls_loss:.4f}, Seg: {train_seg_loss:.4f})")
-            print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | AUROC: {auroc:.4f}")
-            print(f"  Precision: {precision:.4f} | Recall: {recall:.4f} | Specificity: {specificity:.4f}")
-            print(f"  Dice Mean: {dice_mean:.4f} | LR: {current_lr:.6f}")
+            train_loss, train_seg_loss, train_cls_loss = train_epoch(model, device, train_loader, optimizer,
+                                                                     criterion_seg, criterion_cls)
+            val_loss, val_seg_loss, val_cls_loss, auroc, mean_dice = validate_epoch(model, device, val_loader,
+                                                                                    criterion_seg, criterion_cls)
 
-            epoch_nums.append(epoch + 1)
-            train_loss_list.append(train_loss)
-            val_loss_list.append(val_loss)
-            accuracy_list.append(val_acc)
-            auroc_list.append(auroc)
+            scheduler.step(val_loss)
 
-            # Salvăm modelul dacă AUROC e mai bun
-            if auroc > best_val_auroc:
-                best_val_auroc = auroc
-                best_val_acc = val_acc
-                best_val_recall = recall
-                best_val_spec = specificity
-                checkpoint_path = os.path.join(fold_dir, "best_model.pth")
-                torch.save(model.state_dict(), checkpoint_path)
-                print(f"  [Fold {fold_num}] Best model saved at {checkpoint_path} (AUROC improved)")
+            print(f"  Train Loss: {train_loss:.4f} (Seg: {train_seg_loss:.4f}, Cls: {train_cls_loss:.4f})")
+            print(f"  Val Loss:   {val_loss:.4f} (Seg: {val_seg_loss:.4f}, Cls: {val_cls_loss:.4f})")
+            print(f"  Val AUROC:  {auroc:.4f}, Val Dice: {mean_dice:.4f}")
 
-            scheduler.step()
+            # Salvăm AUROC pentru acest fold și epocă
+            fold_auroc_per_epoch[epoch].append(auroc)
 
-        # Plotăm metricile
-        plt.figure(figsize=(10, 6))
-        plt.plot(epoch_nums, train_loss_list, label="Train Loss")
-        plt.plot(epoch_nums, val_loss_list, label="Val Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title(f"Fold {fold_num} - Loss per Epoch")
-        plt.legend()
-        plt.grid(True)
-        plot_loss_path = os.path.join(fold_dir, "loss_per_epoch.png")
-        plt.savefig(plot_loss_path)
-        plt.close()
+            save_segmentation_comparison(val_dataset, model, device, fold_index, epoch + 1, results_dir)
 
-        plt.figure(figsize=(10, 6))
-        plt.plot(epoch_nums, accuracy_list, label="Accuracy")
-        plt.xlabel("Epoch")
-        plt.ylabel("Accuracy")
-        plt.title(f"Fold {fold_num} - Accuracy per Epoch")
-        plt.legend()
-        plt.grid(True)
-        plot_acc_path = os.path.join(fold_dir, "accuracy_per_epoch.png")
-        plt.savefig(plot_acc_path)
-        plt.close()
+        fold_index += 1
 
-        plt.figure(figsize=(10, 6))
-        plt.plot(epoch_nums, auroc_list, label="AUROC")
-        plt.xlabel("Epoch")
-        plt.ylabel("AUROC")
-        plt.title(f"Fold {fold_num} - AUROC per Epoch")
-        plt.legend()
-        plt.grid(True)
-        plot_auroc_path = os.path.join(fold_dir, "auroc_per_epoch.png")
-        plt.savefig(plot_auroc_path)
-        plt.close()
+    # Calculăm media AUROC pe fiecare epocă după toate fold-urile
+    average_auroc_per_epoch = [np.mean(epoch_aurocs) for epoch_aurocs in fold_auroc_per_epoch]
 
-        fold_results.append({
-            "fold": fold_num,
-            "best_val_acc": best_val_acc,
-            "best_val_auroc": best_val_auroc,
-            "best_val_recall": best_val_recall,
-            "best_val_spec": best_val_spec
-        })
+    # Alegem epoca cu cel mai bun AUROC mediu
+    best_epoch_overall = np.argmax(average_auroc_per_epoch) + 1  # +1 pentru că epocile sunt 1-indexate
+    best_overall_auroc = max(average_auroc_per_epoch)
 
-    avg_acc = np.mean([fr["best_val_acc"] for fr in fold_results])
-    avg_auroc = np.mean([fr["best_val_auroc"] for fr in fold_results])
-    avg_recall = np.mean([fr["best_val_recall"] for fr in fold_results])
-    avg_spec = np.mean([fr["best_val_spec"] for fr in fold_results])
+    print(f"\nFinal decision: Best epoch overall is {best_epoch_overall} with AUROC: {best_overall_auroc:.4f}")
+    torch.save(best_model_state, best_model_overall_path)
 
-    print("\n===== K-Fold Cross Validation Results =====")
-    for fr in fold_results:
-        print(f"Fold {fr['fold']} -> ACC: {fr['best_val_acc']:.4f}, AUROC: {fr['best_val_auroc']:.4f}, "
-              f"Recall: {fr['best_val_recall']:.4f}, Spec: {fr['best_val_spec']:.4f}")
-    print(
-        f"\nOverall -> Accuracy: {avg_acc:.4f} | AUROC: {avg_auroc:.4f} | Recall: {avg_recall:.4f} | Specificity: {avg_spec:.4f}")
+    # Salvăm informațiile de training într-un fișier text
+    with open(results_txt, "w", encoding="utf-8") as f:
+        f.write("=== K-Fold Cross Validation Training Summary ===\n")
+        f.write(f"Total Folds: {num_folds}\n")
+        f.write(f"Best Overall Fold: {best_overall_fold} with AUROC: {best_overall_auroc:.4f}\n\n")
+        for fold in fold_logs:
+            f.write(f"Fold {fold['fold']}:\n")
+            f.write(f"  Best Val AUROC: {fold['best_val_auroc']:.4f}\n")
+            f.write(f"  Final Train Loss: {fold['train_loss_history'][-1]:.4f}\n")
+            f.write(f"  Final Val Loss:   {fold['val_loss_history'][-1]:.4f}\n")
+            f.write(f"  Final Val Dice:   {fold['val_dice_history'][-1]:.4f}\n")
+            f.write("\n")
+        f.write("Model saved at: " + os.path.abspath(best_model_overall_path) + "\n")
+        f.write("Plots saved as train_loss_foldX.png, val_loss_foldX.png, val_auroc_foldX.png, val_dice_foldX.png\n")
+        f.write("Segmentation comparison images saved in: " + os.path.abspath(results_dir) + "\n")
+
+    print("\nTraining complete!")
+    print(f"Best overall model is from fold {best_overall_fold} with AUROC: {best_overall_auroc:.4f}")
+    print("Model and training summary saved.")
 
 
 if __name__ == "__main__":
-    json_path = r"D:\study\facultate\test_cuda\data\1234.json"
-    root_dir = r"D:\study\facultate\test_cuda"
-    run_kfold_training(json_path, root_dir, num_epochs=14, batch_size=32, k_folds=5)
+    train_model()

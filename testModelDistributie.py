@@ -7,11 +7,9 @@ from PIL import Image
 import torchvision.transforms as transforms
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, confusion_matrix
 
-# Import modelul (se presupune că returnează două ieșiri: seg_logits și cls_logits)
-from architectures.VNet import UNetSegClassifier1024
+# Importă propriul UNet definit în D:\study\facultate\test_cuda\architectures\UNet.py
+from architectures.UNet import UNet
 from png_dataset import PngDataset  # folosim clasa de dataset deja definită
-
-from architectures.AttentionUnet import AttentionUNet1024Classifier  # Using your custom UNet implementation
 
 def minimal_data_transforms(image, mask):
     print("Aplic transformările minimale pe imagine și mască...")
@@ -39,23 +37,18 @@ def minimal_data_transforms(image, mask):
 
     return image_tensor, mask_tensor
 
-
-def test_model_minimal(json_path, root_dir, model_path, batch_size=1):
+def test_model_minimal(test_data, root_dir, model_path, batch_size=1):
     print("Încep procesul de testare...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Folosesc dispozitivul: {device}")
-
-    print("Încărc datele de testare...")
-    with open(json_path, 'r') as f:
-        test_data = json.load(f)
 
     print("Inițializez dataset-ul și DataLoader-ul...")
     test_dataset = PngDataset(data_dict=test_data, root_dir=root_dir, transform=minimal_data_transforms)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     print("Încărc modelul salvat...")
-    # model = UNetSegClassifier1024(1, 2, 1).to(device)
-    model = AttentionUNet1024Classifier(3, 2, 1).to(device)
+    # Inițializează UNet-ul propriu cu 1 canal de intrare și 1 canal de ieșire.
+    model = UNet(in_channels=1, out_channels=1).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
@@ -70,8 +63,13 @@ def test_model_minimal(json_path, root_dir, model_path, batch_size=1):
             print(f"Procesare batch {i + 1}/{len(test_loader)}...")
             inputs = inputs.to(device)
             gs = gs.to(device).float()
-            _, cls_logits = model(inputs)
-            probs = torch.sigmoid(cls_logits.squeeze(1))
+
+            # Rulează modelul: UNet-ul nostru returnează o ieșire segmentată.
+            outputs = model(inputs)
+            # Pentru scopuri de clasificare, agregăm ieșirea spațial pe fiecare imagine
+            # (de exemplu, media valorilor pe dimensiunile spațiale) pentru a obține un singur logits per imagine.
+            cls_logits = torch.mean(outputs, dim=[2, 3])
+            probs = torch.sigmoid(cls_logits).squeeze(1)
             all_probs.append(probs.cpu())
             all_labels.append(gs.cpu())
             pred_labels = (probs > 0.5).float()
@@ -112,9 +110,43 @@ def test_model_minimal(json_path, root_dir, model_path, batch_size=1):
         "specificity": specificity
     }
 
+def load_json(path):
+    """
+    Încarcă un fișier JSON de la calea specificată.
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def merge_datasets(random_dataset, cancer_dataset):
+    """
+    Combină două seturi de date (sub formă de dicționare).
+    Se presupune că cheile din fiecare dicționar sunt unice.
+    """
+    merged = {}
+    merged.update(random_dataset)
+    merged.update(cancer_dataset)
+    return merged
 
 if __name__ == "__main__":
-    json_path = r"D:\study\facultate\test_cuda\data\output9CanaleV3\test.json"
-    root_dir = r"D:\study\facultate\test_cuda\data"
-    model_path = r"D:\study\facultate\test_cuda\best_multi_task_model.pth"
-    test_model_minimal(json_path, root_dir, model_path, batch_size=32)
+    # Căile către fișierele dataseturilor
+    # Random dataset (format JSON) generat de scriptul data_random.py
+    random_dataset_path = r"D:\study\facultate\test_cuda\data\output9CanaleV3\data_random.json"
+    cancer_dataset_path = r"D:\study\facultate\test_cuda\Bosma22a_segmentation_slices.json"
+
+    # Directorul rădăcină din care sunt accesate imaginile
+    root_dir = r"D:\study\facultate\test_cuda"
+    # Calea către modelul antrenat (care a fost antrenat cu UNet-ul din architectures\UNet.py)
+    model_path = r"D:\study\facultate\test_cuda\results\fold_5\best_model.pth"
+
+    print("Încărc seturile de date...")
+    random_dataset = load_json(random_dataset_path)
+    cancer_dataset = load_json(cancer_dataset_path)
+
+    print("Combin seturile de date...")
+    combined_dataset = merge_datasets(random_dataset, cancer_dataset)
+
+    results = test_model_minimal(combined_dataset, root_dir, model_path, batch_size=16)
+
+    print("Rezultatele testării:")
+    for metric, value in results.items():
+        print(f"{metric}: {value:.4f}")
