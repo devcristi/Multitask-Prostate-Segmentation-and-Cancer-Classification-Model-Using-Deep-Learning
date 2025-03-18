@@ -14,8 +14,8 @@ This project aims to develop a dual-purpose model capable of both segmenting the
 
 ## Technologies Used
 - **Python:** Main programming language used in the project.
-- **Deep Learning Frameworks:** Likely using frameworks such as TensorFlow or PyTorch.
-- **UNet Architecture:** Core deep learning model for segmentation and classification tasks.
+- **Deep Learning Framework:** PyTorch.
+- **UNet Architecture:** Attention-UNet. Core deep learning model for segmentation and classification tasks.
 - **Other Libraries and Tools:**
   - NumPy and Pandas for data manipulation.
   - OpenCV for image processing.
@@ -35,7 +35,7 @@ This project aims to develop a dual-purpose model capable of both segmenting the
 ## Getting Started
 To get started with the project:
 1. Clone the repository.
-2. Set up your Python environment and install the required packages listed in `requirements.txt`.
+2. Have installed Python, CUDA, Pytorch and other libraries.
 3. Review the project structure to understand how data preprocessing, model training, and evaluation scripts are organized.
 4. Run the experiments using the provided scripts and configurations.
 
