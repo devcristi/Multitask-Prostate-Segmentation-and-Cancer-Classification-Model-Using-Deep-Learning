@@ -17,16 +17,20 @@ This project aims to develop a dual-purpose model capable of both segmenting the
 - **Deep Learning Frameworks:** Likely using frameworks such as TensorFlow or PyTorch.
 - **UNet Architecture:** Core deep learning model for segmentation and classification tasks.
 - **Other Libraries and Tools:**
-  - Numpy and Pandas for data manipulation.
+  - NumPy and Pandas for data manipulation.
   - OpenCV for image processing.
   - Scikit-learn for additional machine learning utilities and evaluations.
 
-## Results (Overview)
+## Classification Results (Overview)
 - **Average Accuracy:** 73.8%
 - **AUROC:** 83.5%
 - **Recall:** 85.0%
 - **Specificity:** 62.2%
 *Note: These results were obtained without the segmentation feature being active during classification.*
+
+## Segmentation Results (Overview)
+- **Segmentation Performance:** 70%
+*Note: This segmentation result is reported independently from the classification results.*
 
 ## Getting Started
 To get started with the project:
@@ -35,8 +39,8 @@ To get started with the project:
 3. Review the project structure to understand how data preprocessing, model training, and evaluation scripts are organized.
 4. Run the experiments using the provided scripts and configurations.
 
+## Note
+For proper functionality, a dedicated GPU is required.
+
 ## Contributing
 Contributions are welcome! Please open an issue or submit a pull request to discuss improvements or new features.
-
-## License
-Include the license information here.
