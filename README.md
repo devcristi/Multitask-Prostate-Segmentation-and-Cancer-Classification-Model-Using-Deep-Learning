@@ -35,7 +35,7 @@ This project aims to develop a dual-purpose model capable of both segmenting the
 ## Getting Started
 To get started with the project:
 1. Clone the repository.
-2. Have installed Python, CUDA, Pytorch and other libraries.
+2. Have installed Python, CUDA, PyTorch, PI-CAI dataset and other libraries.
 3. Review the project structure to understand how data preprocessing, model training, and evaluation scripts are organized.
 4. Run the experiments using the provided scripts and configurations.
 
